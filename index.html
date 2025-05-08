@@ -1,0 +1,216 @@
+﻿<!DOCTYPE html><html lang="fr"><head>
+    <meta charset="utf-8">
+    <title>Tower Survivor</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+    <style>html,body{margin:0;height:100%;background:#000;overflow:hidden}*{box-sizing:border-box;font-family:monospace}</style>
+    <script src="https://cdn.jsdelivr.net/npm/phaser@3.88.2/dist/phaser.min.js"></script>
+</head><body><script>
+    (()=>{"use strict";
+
+        /* === PARAMÈTRES ====================================================== */
+        const CFG={
+            TOWER:{HP:100,FIRE_DELAY:460,BULLET_SPEED:660,DMG:4},
+            ENEMY:{HP:10,SPD:30,DMG:5},
+            WAVES:{START_INT:6500,MIN_INT:1600,DECAY:0.97,SPREAD:450},
+            GOLD :{BASE_KILL:10},
+            UPGR :{
+                atk:{cost:35,mult:1.5,dmgInc:1},
+                spd:{cost:50,mult:1.4,delayMul:0.9,min:90},
+                inc:{cost:55,mult:1.5,inc:1}               // +1 g / tick & +20 % loot / lvl
+            }
+        };
+
+        /* === SCÈNES ========================================================= */
+        class Boot extends Phaser.Scene{create(){this.scene.start("play");}}
+
+        class Play extends Phaser.Scene{
+            constructor(){super("play");}
+            init(){this.reset();}
+            reset(){
+                Object.assign(this,{
+                    hp:CFG.TOWER.HP, fireDelay:CFG.TOWER.FIRE_DELAY, dmg:CFG.TOWER.DMG,
+                    gold:0, income:1, atkLvl:0, spdLvl:0, incLvl:0,
+                    wave:0, waveInt:CFG.WAVES.START_INT, waveTimer:0,
+                    queue:[], spawnCd:0, alive:true,
+                    elapsed:0, kills:0
+                });
+            }
+            create(){
+                const {width:w,height:h}=this.scale;
+                this.center=new Phaser.Math.Vector2(w/2,h/2);
+                this.tower=this.add.circle(this.center.x,this.center.y,24,0x00ff00);
+                this.physics.add.existing(this.tower,true);
+                this.enemies=this.physics.add.group();
+                this.bullets=this.physics.add.group();
+                this.physics.add.overlap(this.bullets,this.enemies,this.hit,null,this);
+                this.physics.add.overlap(this.enemies,this.tower ,this.touch,null,this);
+
+                this.fireEvt=this.makeFireEvt();
+                /* revenu passif */
+                this.time.addEvent({delay:100,loop:true,callback:()=>{this.gold+=this.income;}});
+                this.scene.launch("ui",{play:this});
+            }
+            makeFireEvt(){
+                if(this.fireEvt)this.fireEvt.remove(false);
+                return this.time.addEvent({delay:this.fireDelay,loop:true,callback:this.shoot,callbackScope:this});
+            }
+            update(_,dt){
+                if(!this.alive)return;
+                this.elapsed+=dt;
+                /* vague */
+                this.waveTimer+=dt;
+                if(this.waveTimer>=this.waveInt){
+                    this.waveTimer=0;
+                    this.prepareWave();
+                    this.waveInt=Math.max(CFG.WAVES.MIN_INT,this.waveInt*CFG.WAVES.DECAY);
+                }
+                /* drip */
+                if(this.queue.length){
+                    this.spawnCd+=dt;
+                    if(this.spawnCd>=CFG.WAVES.SPREAD){
+                        this.spawnCd=0;this.spawnEnemy(this.queue.shift());
+                    }
+                }
+                /* rotation */
+                const t=this.nearest();if(t)this.tower.setRotation(Phaser.Math.Angle.BetweenPoints(this.tower,t));
+            }
+
+            /* ---------- VAGUES & ENNEMIS ---------------- */
+            prepareWave(){
+                ++this.wave;
+                const baseHP=CFG.ENEMY.HP+this.wave*2;
+                const baseSPD=CFG.ENEMY.SPD+this.wave*0.8;
+
+                /* boss */
+                if(this.wave%10===0){
+                    this.queue.push({type:"boss",hp:baseHP*3,spd:baseSPD*0.4,r:32,col:0xff0000,lootM:5});
+                    return;
+                }
+
+                const count= Math.max(2,Math.round((4+this.wave*0.7)/2));   // ÷2 : moitié moins qu’avant
+                for(let i=0;i<count;i++){
+                    const r=Math.random();
+                    if(r<0.5)        // petit
+                        this.queue.push({type:"small",hp:baseHP*0.6,spd:baseSPD*1.6,r:10,col:0xff5555,lootM:0.8});
+                    else if(r<0.85)  // moyen
+                        this.queue.push({type:"med",hp:baseHP,spd:baseSPD,r:16,col:0xff0000,lootM:1});
+                    else             // gros
+                        this.queue.push({type:"big",hp:baseHP*2,spd:baseSPD*0.6,r:24,col:0xaa0000,lootM:2});
+                }
+            }
+            spawnEnemy(d){
+                const R=Math.max(this.scale.width,this.scale.height)*0.9;
+                const a=Phaser.Math.FloatBetween(0,Math.PI*2);
+                const x=this.center.x+Math.cos(a)*R, y=this.center.y+Math.sin(a)*R;
+                const e=this.add.circle(x,y,d.r,d.col);this.physics.add.existing(e);
+                Object.assign(e,{hp:d.hp,dmg:CFG.ENEMY.DMG,spd:d.spd,lootM:d.lootM});
+                this.enemies.add(e);
+                const v=this.center.clone().subtract(e).normalize().scale(e.spd);
+                e.body.setVelocity(v.x,v.y);
+            }
+
+            /* ---------- COMBAT ------------------------- */
+            shoot(){
+                const target=this.nearest();if(!target)return;
+
+                const lasers=1+Math.floor(this.atkLvl/10);
+                const salvos=1+Math.floor(this.spdLvl/10);
+
+                for(let s=0;s<salvos;s++){
+                    this.time.delayedCall(s*70,()=>{this.fireVolley(target,lasers);});
+                }
+            }
+            fireVolley(target,lasers){
+                const baseAng=Phaser.Math.Angle.Between(this.center.x,this.center.y,target.x,target.y);
+                const spread=0.12;                     // 0.12 rad ≈ 7°
+                for(let i=0;i<lasers;i++){
+                    const off=(i-(lasers-1)/2)*spread;
+                    const ang=baseAng+off;
+                    const b=this.add.rectangle(this.center.x,this.center.y,30,3,0xffff00).setRotation(ang);
+                    this.physics.add.existing(b);this.bullets.add(b);b.dmg=this.dmg;
+                    const v=this.physics.velocityFromRotation(ang,CFG.TOWER.BULLET_SPEED);
+                    b.body.setVelocity(v.x,v.y);
+                }
+            }
+            nearest(){
+                let n=null,b=Infinity;
+                this.enemies.children.each(e=>{
+                    const d=Phaser.Math.Distance.Squared(e.x,e.y,this.center.x,this.center.y);
+                    if(d<b){b=d;n=e;} });
+                return n;
+            }
+            hit(b,e){b.destroy();e.hp-=b.dmg;
+                if(e.hp<=0){e.destroy();this.kills++;
+                    const loot=(CFG.GOLD.BASE_KILL+this.wave/2)*e.lootM*(1+this.incLvl*0.2);
+                    this.gold+=loot;}
+            }
+            touch(){this.gameOver();}
+            /* ---------- UPGRADES ----------------------- */
+            upgrade(k){
+                const u=CFG.UPGR[k];if(this.gold<u.cost)return;
+                this.gold-=u.cost;u.cost=Math.ceil(u.cost*u.mult);
+                if(k==="atk"){this.dmg+=u.dmgInc;++this.atkLvl;}
+                if(k==="spd"){this.fireDelay=Math.max(u.min,Math.floor(this.fireDelay*u.delayMul));
+                    ++this.spdLvl;this.fireEvt=this.makeFireEvt();}
+                if(k==="inc"){this.income+=u.inc;++this.incLvl;}
+            }
+            /* ---------- GAME OVER ---------------------- */
+            gameOver(){
+                if(!this.alive)return;
+                this.alive=false;
+                const timeSec=Math.floor(this.elapsed/1000);
+                this.finalScore=timeSec*10+this.kills*5;
+                this.scene.pause();
+                this.scene.launch("over",{score:this.finalScore});
+            }
+        }
+
+        /* === HUD ============================================================= */
+        class UI extends Phaser.Scene{
+            constructor(){super("ui");}init(d){this.p=d.play;}
+            create(){
+                this.t=this.add.text(8,8,"",{font:"18px monospace",fill:"#00ff00"});
+                this.btns={};this.mk("atk","Attaque",8,40);
+                this.mk("spd","Cadence",8,70);this.mk("inc","Income",8,100);
+                this.up();
+            }
+            mk(k,l,x,y){
+                this.btns[k]=this.add.text(x,y,"",{font:"16px monospace",fill:"#ffff00"})
+                    .setInteractive({useHandCursor:true})
+                    .on("pointerdown",()=>{this.p.upgrade(k);this.up();});
+            }
+            up(){
+                this.btns.atk.setText(`Attaque (${CFG.UPGR.atk.cost}g)`);
+                this.btns.spd.setText(`Cadence (${CFG.UPGR.spd.cost}g)`);
+                this.btns.inc.setText(`Income  (${CFG.UPGR.inc.cost}g)`);
+            }
+            update(){
+                this.t.setText(`HP:${this.p.hp}  Gold:${Math.floor(this.p.gold)}  Wave:${this.p.wave}  Kills:${this.p.kills}`);
+            }
+        }
+
+        /* === GAME OVER OVERLAY ============================================== */
+        class Over extends Phaser.Scene{
+            constructor(){super("over");}init(d){this.score=d.score;}
+            create(){
+                const {width:w,height:h}=this.scale;
+                this.add.rectangle(0,0,w,h,0x000000,0.75).setOrigin(0);
+                this.add.text(w/2,h/2-50,"GAME OVER",{font:"32px monospace",fill:"#ff0000"}).setOrigin(0.5);
+                this.add.text(w/2,h/2-10,`SCORE : ${this.score}`,{font:"24px monospace",fill:"#ffff00"}).setOrigin(0.5);
+                this.add.text(w/2,h/2+40,"RESTART",{font:"24px monospace",fill:"#00ff00"}).setOrigin(0.5)
+                    .setInteractive({useHandCursor:true})
+                    .on("pointerdown",()=>{this.scene.stop("over");this.scene.stop("ui");this.scene.start("play");});
+            }
+        }
+
+        /* === INIT ============================================================ */
+        window.addEventListener("load",()=>{
+            new Phaser.Game({
+                type:Phaser.AUTO,width:window.innerWidth,height:window.innerHeight,
+                backgroundColor:"#000",parent:document.body,
+                physics:{default:"arcade",arcade:{debug:false}},
+                scene:[Boot,Play,UI,Over]
+            });
+        });
+    })();
+</script></body></html>
